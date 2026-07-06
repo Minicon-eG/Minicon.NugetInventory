@@ -3,7 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
 
-var (directory, output, delimiter, fetchDescriptions, showHelp) = ParseArgs(args);
+var (directory, output, delimiter, fetchMetadata, showHelp) = ParseArgs(args);
 
 if (showHelp || directory is null)
 {
@@ -16,7 +16,8 @@ if (showHelp || directory is null)
         Optionen:
           -o, --output <datei>      Pfad der CSV-Ausgabedatei (Standard: nuget-packages.csv)
           -d, --delimiter <zeichen> CSV-Trennzeichen (Standard: ';')
-          --no-descriptions         Keine Beschreibungen von nuget.org laden
+          --no-metadata             Keine Metadaten (Beschreibung, Lizenz, Abhängigkeiten)
+                                    von nuget.org laden (Alias: --no-descriptions)
           -h, --help                Diese Hilfe anzeigen
         """);
     return directory is null && !showHelp ? 1 : 0;
@@ -61,24 +62,41 @@ foreach (var projectFile in projectFiles)
 
 Console.WriteLine($"{usages.Count} Paket/Version-Kombinationen, {usages.Keys.Select(k => k.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count()} eindeutige Pakete");
 
-// Beschreibungen von nuget.org laden
-var descriptions = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-if (fetchDescriptions && usages.Count > 0)
+// Metadaten (Beschreibung, Lizenz, Abhängigkeiten) je Paketversion von nuget.org laden
+var metadata = new ConcurrentDictionary<(string Id, string Version), PackageMetadata>();
+var fallbackDescriptions = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+if (fetchMetadata && usages.Count > 0)
 {
-    var uniqueIds = usages.Keys.Select(k => k.Id).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-    Console.WriteLine($"Lade Beschreibungen für {uniqueIds.Count} Pakete von nuget.org ...");
+    var pairs = usages.Keys.ToList();
+    Console.WriteLine($"Lade Metadaten für {pairs.Count} Paketversionen von nuget.org ...");
 
     using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
-    http.DefaultRequestHeaders.UserAgent.ParseAdd("nuget-inventory/1.0");
+    http.DefaultRequestHeaders.UserAgent.ParseAdd("nuget-inventory/1.1");
 
     var done = 0;
-    await Parallel.ForEachAsync(uniqueIds, new ParallelOptions { MaxDegreeOfParallelism = 8 }, async (id, ct) =>
+    await Parallel.ForEachAsync(pairs, new ParallelOptions { MaxDegreeOfParallelism = 8 }, async (pair, ct) =>
     {
-        descriptions[id] = await FetchDescriptionAsync(http, id, ct);
+        metadata[pair] = await FetchNuspecMetadataAsync(http, pair.Id, pair.Version, ct);
         var count = Interlocked.Increment(ref done);
-        if (count % 25 == 0 || count == uniqueIds.Count)
-            Console.WriteLine($"  {count}/{uniqueIds.Count}");
+        if (count % 25 == 0 || count == pairs.Count)
+            Console.WriteLine($"  {count}/{pairs.Count}");
     });
+
+    // Fallback über die Suche, wenn das nuspec keine Beschreibung geliefert hat
+    // (z. B. unbekannte Version, Versionsbereich oder Paket nicht auf nuget.org)
+    var missingIds = pairs
+        .Where(p => metadata[p].Description.Length == 0)
+        .Select(p => p.Id)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+    if (missingIds.Count > 0)
+    {
+        Console.WriteLine($"Lade Beschreibungen für {missingIds.Count} Pakete über die nuget.org-Suche ...");
+        await Parallel.ForEachAsync(missingIds, new ParallelOptions { MaxDegreeOfParallelism = 8 }, async (id, ct) =>
+        {
+            fallbackDescriptions[id] = await FetchDescriptionAsync(http, id, ct);
+        });
+    }
 }
 
 // CSV schreiben
@@ -88,16 +106,20 @@ var rows = usages
     .ThenBy(u => u.Key.Version, VersionStringComparer.Instance);
 
 var sb = new StringBuilder();
-sb.AppendLine(string.Join(delimiter, new[] { "PackageId", "Version", "Projects", "Description" }.Select(f => CsvEscape(f, delimiter))));
+sb.AppendLine(string.Join(delimiter, new[] { "PackageId", "Version", "Projects", "Description", "License", "Dependencies" }.Select(f => CsvEscape(f, delimiter))));
 foreach (var ((id, version), projects) in rows)
 {
-    descriptions.TryGetValue(id, out var description);
+    metadata.TryGetValue((id, version), out var meta);
+    meta ??= PackageMetadata.Empty;
+    var description = meta.Description.Length > 0 ? meta.Description : fallbackDescriptions.GetValueOrDefault(id, "");
     sb.AppendLine(string.Join(delimiter,
     [
         CsvEscape(id, delimiter),
         CsvEscape(version, delimiter),
         CsvEscape(string.Join(" | ", projects), delimiter),
-        CsvEscape(description ?? "", delimiter),
+        CsvEscape(description, delimiter),
+        CsvEscape(meta.License, delimiter),
+        CsvEscape(meta.Dependencies, delimiter),
     ]));
 }
 
@@ -106,12 +128,12 @@ await File.WriteAllTextAsync(outputPath, sb.ToString(), new UTF8Encoding(encoder
 Console.WriteLine($"CSV geschrieben: {outputPath}");
 return 0;
 
-static (string? Directory, string Output, string Delimiter, bool FetchDescriptions, bool ShowHelp) ParseArgs(string[] args)
+static (string? Directory, string Output, string Delimiter, bool FetchMetadata, bool ShowHelp) ParseArgs(string[] args)
 {
     string? directory = null;
     var output = "nuget-packages.csv";
     var delimiter = ";";
-    var fetchDescriptions = true;
+    var fetchMetadata = true;
     var showHelp = false;
 
     for (var i = 0; i < args.Length; i++)
@@ -127,8 +149,8 @@ static (string? Directory, string Output, string Delimiter, bool FetchDescriptio
             case "-d" or "--delimiter" when i + 1 < args.Length:
                 delimiter = args[++i];
                 break;
-            case "--no-descriptions":
-                fetchDescriptions = false;
+            case "--no-metadata" or "--no-descriptions":
+                fetchMetadata = false;
                 break;
             default:
                 directory ??= args[i];
@@ -136,7 +158,7 @@ static (string? Directory, string Output, string Delimiter, bool FetchDescriptio
         }
     }
 
-    return (directory, output, delimiter, fetchDescriptions, showHelp);
+    return (directory, output, delimiter, fetchMetadata, showHelp);
 }
 
 static IEnumerable<string> GetRelativeSegments(string root, string path) =>
@@ -224,6 +246,97 @@ static CpmInfo? FindCpm(string startDir, Dictionary<string, CpmInfo?> cache)
     return cache[startDir] = result;
 }
 
+// Lädt das .nuspec einer konkreten Paketversion vom flatcontainer und extrahiert
+// Beschreibung, Lizenz und Abhängigkeiten. Liefert Empty, wenn die Version nicht
+// auflösbar ist (Range/Wildcard/unbekannt) oder das Paket nicht auf nuget.org liegt.
+static async Task<PackageMetadata> FetchNuspecMetadataAsync(HttpClient http, string packageId, string version, CancellationToken ct)
+{
+    var normalized = NormalizeVersion(version);
+    if (normalized.Length == 0)
+        return PackageMetadata.Empty;
+
+    try
+    {
+        var idLower = packageId.ToLowerInvariant();
+        var url = $"https://api.nuget.org/v3-flatcontainer/{idLower}/{normalized.ToLowerInvariant()}/{idLower}.nuspec";
+        using var response = await http.GetAsync(url, ct);
+        if (!response.IsSuccessStatusCode)
+            return PackageMetadata.Empty;
+
+        var doc = XDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+        var meta = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "metadata");
+        if (meta is null)
+            return PackageMetadata.Empty;
+
+        var description = FlattenWhitespace(meta.Elements().FirstOrDefault(e => e.Name.LocalName == "description")?.Value ?? "");
+
+        var licenseElement = meta.Elements().FirstOrDefault(e => e.Name.LocalName == "license");
+        var licenseUrl = meta.Elements().FirstOrDefault(e => e.Name.LocalName == "licenseUrl")?.Value.Trim() ?? "";
+        var license = licenseElement?.Attribute("type")?.Value switch
+        {
+            "expression" => licenseElement.Value.Trim(),
+            "file" => licenseUrl.Length > 0 ? licenseUrl : "(Lizenzdatei im Paket)",
+            _ => licenseUrl,
+        };
+
+        // Abhängigkeiten über alle Zielframework-Gruppen hinweg zusammenfassen
+        var dependencies = meta.Descendants()
+            .Where(e => e.Name.LocalName == "dependency")
+            .Select(d =>
+            {
+                var depId = d.Attribute("id")?.Value?.Trim();
+                if (string.IsNullOrEmpty(depId))
+                    return null;
+                var range = d.Attribute("version")?.Value?.Trim();
+                return string.IsNullOrEmpty(range) ? depId : $"{depId} {range}";
+            })
+            .Where(d => d is not null)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(d => d, StringComparer.OrdinalIgnoreCase);
+
+        return new PackageMetadata(description, license, string.Join(" | ", dependencies));
+    }
+    catch
+    {
+        return PackageMetadata.Empty;
+    }
+}
+
+// Normalisiert auf die von nuget.org verwendete Form (führende Nullen weg, mind. 3 Teile,
+// vierter Teil entfällt bei 0). Liefert "", wenn keine konkrete Version vorliegt.
+static string NormalizeVersion(string version)
+{
+    var v = version.Trim().Trim('[', ']', '(', ')');
+    if (v.Length == 0 || v.Contains(','))
+        return "";
+
+    var plus = v.IndexOf('+');
+    if (plus >= 0)
+        v = v[..plus];
+
+    var dash = v.IndexOf('-');
+    var release = dash >= 0 ? v[..dash] : v;
+    var suffix = dash >= 0 ? v[dash..] : "";
+
+    var parts = release.Split('.');
+    var numbers = new List<int>(4);
+    foreach (var part in parts)
+    {
+        if (!int.TryParse(part, out var number))
+            return "";
+        numbers.Add(number);
+    }
+
+    while (numbers.Count < 3)
+        numbers.Add(0);
+    if (numbers.Count == 4 && numbers[3] == 0)
+        numbers.RemoveAt(3);
+    if (numbers.Count > 4)
+        return "";
+
+    return string.Join('.', numbers) + suffix;
+}
+
 static async Task<string> FetchDescriptionAsync(HttpClient http, string packageId, CancellationToken ct)
 {
     try
@@ -244,14 +357,17 @@ static async Task<string> FetchDescriptionAsync(HttpClient http, string packageI
             return "";
 
         var description = first.TryGetProperty("description", out var desc) ? desc.GetString() ?? "" : "";
-        // Zeilenumbrüche/Mehrfach-Whitespace einebnen, damit die CSV lesbar bleibt
-        return string.Join(' ', description.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return FlattenWhitespace(description);
     }
     catch
     {
         return "";
     }
 }
+
+// Zeilenumbrüche/Mehrfach-Whitespace einebnen, damit die CSV lesbar bleibt
+static string FlattenWhitespace(string value) =>
+    string.Join(' ', value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
 static string CsvEscape(string value, string delimiter)
 {
@@ -261,6 +377,11 @@ static string CsvEscape(string value, string delimiter)
 }
 
 sealed record CpmInfo(Dictionary<string, string> Versions, List<(string Id, string Version)> GlobalPackages);
+
+sealed record PackageMetadata(string Description, string License, string Dependencies)
+{
+    public static readonly PackageMetadata Empty = new("", "", "");
+}
 
 // Sortiert Versionsstrings numerisch (1.2.10 nach 1.2.9), fällt sonst auf Textvergleich zurück
 sealed class VersionStringComparer : IComparer<string>
